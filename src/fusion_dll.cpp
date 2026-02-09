@@ -5,8 +5,11 @@
 #include <vector>
 #include <string>
 #include <iostream>
+#include <fstream>
+#include <cmath>
 #include <sstream>
 #include <iomanip>
+#include <unordered_map>
 
 // filesystem 헤더 호환성 처리
 #if __cplusplus >= 201703L && defined(__has_include)
@@ -56,6 +59,98 @@
 #define FUSION_DLL_EXPORTS
 
 namespace fusion {
+
+struct FilterSnapshot {
+    KalmanState state_y;
+    KalmanState state_z;
+    KalmanCovariance cov_y;
+    KalmanCovariance cov_z;
+};
+
+static std::string build_state_file_path(const std::string& output_file_path) {
+    fs::path output_path(output_file_path);
+    std::string output_dir = output_path.parent_path().string();
+    if (output_dir.empty()) {
+        output_dir = ".";
+    }
+    char last_char = output_dir.back();
+    if (last_char != '/' && last_char != '\\') {
+        output_dir += "/";
+    }
+    return output_dir + "local_var_laststate.txt";
+}
+
+static FilterSnapshot capture_snapshot(const KalmanFilter& filter_y, const KalmanFilter& filter_z) {
+    FilterSnapshot snapshot;
+    snapshot.state_y = filter_y.getState();
+    snapshot.state_z = filter_z.getState();
+    snapshot.cov_y = filter_y.getCovariance();
+    snapshot.cov_z = filter_z.getCovariance();
+    return snapshot;
+}
+
+static bool save_filter_snapshot(const std::string& file_path, const FilterSnapshot& snapshot) {
+    std::ofstream file(file_path);
+    if (!file.is_open()) {
+        return false;
+    }
+    file << std::setprecision(17);
+    file << "state_y_position " << snapshot.state_y.position << "\n";
+    file << "state_y_velocity " << snapshot.state_y.velocity << "\n";
+    file << "cov_y_p00 " << snapshot.cov_y.p00 << "\n";
+    file << "cov_y_p01 " << snapshot.cov_y.p01 << "\n";
+    file << "cov_y_p10 " << snapshot.cov_y.p10 << "\n";
+    file << "cov_y_p11 " << snapshot.cov_y.p11 << "\n";
+    file << "state_z_position " << snapshot.state_z.position << "\n";
+    file << "state_z_velocity " << snapshot.state_z.velocity << "\n";
+    file << "cov_z_p00 " << snapshot.cov_z.p00 << "\n";
+    file << "cov_z_p01 " << snapshot.cov_z.p01 << "\n";
+    file << "cov_z_p10 " << snapshot.cov_z.p10 << "\n";
+    file << "cov_z_p11 " << snapshot.cov_z.p11 << "\n";
+    return true;
+}
+
+static bool load_filter_snapshot(const std::string& file_path, FilterSnapshot& snapshot) {
+    std::ifstream file(file_path);
+    if (!file.is_open()) {
+        return false;
+    }
+    std::string line;
+    std::unordered_map<std::string, double> values;
+    while (std::getline(file, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        std::istringstream iss(line);
+        std::string key;
+        double value;
+        if (!(iss >> key >> value)) {
+            continue;
+        }
+        values[key] = value;
+    }
+    auto get_value = [&](const std::string& key, double& out) -> bool {
+        auto it = values.find(key);
+        if (it == values.end()) {
+            return false;
+        }
+        out = it->second;
+        return true;
+    };
+    return get_value("state_y_position", snapshot.state_y.position) &&
+           get_value("state_y_velocity", snapshot.state_y.velocity) &&
+           get_value("cov_y_p00", snapshot.cov_y.p00) &&
+           get_value("cov_y_p01", snapshot.cov_y.p01) &&
+           get_value("cov_y_p10", snapshot.cov_y.p10) &&
+           get_value("cov_y_p11", snapshot.cov_y.p11) &&
+           get_value("state_z_position", snapshot.state_z.position) &&
+           get_value("state_z_velocity", snapshot.state_z.velocity) &&
+           get_value("cov_z_p00", snapshot.cov_z.p00) &&
+           get_value("cov_z_p01", snapshot.cov_z.p01) &&
+           get_value("cov_z_p10", snapshot.cov_z.p10) &&
+           get_value("cov_z_p11", snapshot.cov_z.p11);
+}
+
 
 // 내부 구현 함수
 int process_fusion_internal(
@@ -296,6 +391,135 @@ int process_fusion_batch_internal(
     return FUSION_SUCCESS;
 }
 
+// 실시간 처리 내부 구현 함수 (100 타임스텝 단위 저장/복원)
+int process_fusion_realtime_internal(
+    const std::string& input_file_path,
+    const std::string& output_file_path,
+    double Q,
+    double R) {
+    
+    const size_t MIN_ROWS = 20;
+    const size_t batch_size = 100;
+    
+    // CSV 파일 파싱
+    std::vector<InputData> input_data;
+    if (!parse_csv(input_file_path, input_data)) {
+        return FUSION_ERROR_FILE_NOT_FOUND;
+    }
+    
+    // 최소 데이터 개수 확인
+    if (input_data.size() < MIN_ROWS) {
+        std::cerr << "Error: Insufficient data. Minimum " << MIN_ROWS
+                  << " rows required, but got " << input_data.size() << std::endl;
+        return FUSION_ERROR_INSUFFICIENT_DATA;
+    }
+    
+    // 데이터 추출
+    std::vector<double> gps_y_data;
+    std::vector<double> gps_z_data;
+    std::vector<double> acc_y_data;
+    std::vector<double> acc_z_data;
+    std::vector<int> fix_data;
+    std::vector<std::string> datetime_data;
+    
+    for (const auto& row : input_data) {
+        datetime_data.push_back(row.datetime);
+        gps_y_data.push_back(row.gps_y);
+        gps_z_data.push_back(row.gps_z);
+        acc_y_data.push_back(row.acc_y);
+        acc_z_data.push_back(row.acc_z);
+        fix_data.push_back(row.fix);
+    }
+    
+    KalmanParams params(Q, R);
+    KalmanFilter filter_y(params);
+    KalmanFilter filter_z(params);
+    
+    // 상태 파일에서 복원 시도
+    std::string state_file_path = build_state_file_path(output_file_path);
+    FilterSnapshot snapshot;
+    bool has_snapshot = load_filter_snapshot(state_file_path, snapshot);
+    if (has_snapshot) {
+        filter_y.setState(snapshot.state_y);
+        filter_y.setCovariance(snapshot.cov_y);
+        filter_z.setState(snapshot.state_z);
+        filter_z.setCovariance(snapshot.cov_z);
+    }
+    
+    std::vector<OutputData> all_output_data;
+    size_t total_rows = input_data.size();
+    size_t num_batches = (total_rows + batch_size - 1) / batch_size;
+    
+    bool is_first_batch = true;
+    
+    for (size_t batch_idx = 0; batch_idx < num_batches; batch_idx++) {
+        size_t start_idx = batch_idx * batch_size;
+        size_t end_idx = std::min(start_idx + batch_size, total_rows);
+        size_t current_batch_size = end_idx - start_idx;
+        
+        std::vector<double> gps_y_batch;
+        std::vector<double> gps_z_batch;
+        std::vector<double> acc_y_batch;
+        std::vector<double> acc_z_batch;
+        std::vector<int> fix_batch;
+        std::vector<std::string> datetime_batch;
+        
+        for (size_t i = start_idx; i < end_idx; i++) {
+            datetime_batch.push_back(datetime_data[i]);
+            gps_y_batch.push_back(gps_y_data[i]);
+            gps_z_batch.push_back(gps_z_data[i]);
+            acc_y_batch.push_back(acc_y_data[i]);
+            acc_z_batch.push_back(acc_z_data[i]);
+            fix_batch.push_back(fix_data[i]);
+        }
+        
+        if (is_first_batch && !has_snapshot) {
+            double initial_y = gps_y_batch[0];
+            double initial_z = gps_z_batch[0];
+            for (size_t i = 0; i < gps_y_batch.size(); i++) {
+                if (fix_batch[i] >= 1 && !std::isnan(gps_y_batch[i]) && std::isfinite(gps_y_batch[i])) {
+                    initial_y = gps_y_batch[i];
+                    break;
+                }
+            }
+            for (size_t i = 0; i < gps_z_batch.size(); i++) {
+                if (fix_batch[i] >= 1 && !std::isnan(gps_z_batch[i]) && std::isfinite(gps_z_batch[i])) {
+                    initial_z = gps_z_batch[i];
+                    break;
+                }
+            }
+            filter_y.reset(initial_y);
+            filter_z.reset(initial_z);
+        }
+        is_first_batch = false;
+        
+        std::vector<double> displacement_y_batch = filter_y.processBatch(
+            gps_y_batch, acc_y_batch, fix_batch);
+        std::vector<double> displacement_z_batch = filter_z.processBatch(
+            gps_z_batch, acc_z_batch, fix_batch);
+        
+        for (size_t i = 0; i < current_batch_size; i++) {
+            OutputData output_row;
+            output_row.datetime = datetime_batch[i];
+            output_row.displacement_y = displacement_y_batch[i];
+            output_row.displacement_z = displacement_z_batch[i];
+            all_output_data.push_back(output_row);
+        }
+        
+        // 100 타임스텝 처리 후 상태 저장
+        FilterSnapshot latest_snapshot = capture_snapshot(filter_y, filter_z);
+        if (!save_filter_snapshot(state_file_path, latest_snapshot)) {
+            std::cerr << "Warning: Failed to save state file: " << state_file_path << std::endl;
+        }
+    }
+    
+    if (!save_csv(output_file_path, all_output_data)) {
+        return FUSION_ERROR_FILE_NOT_FOUND;
+    }
+    
+    return FUSION_SUCCESS;
+}
+
 } // namespace fusion
 
 // C API 구현
@@ -361,6 +585,32 @@ FUSION_API int fusion_process_csv_batch(
     }
 }
 
+FUSION_API int fusion_process_csv_realtime(
+    const char* input_file_path,
+    const char* output_file_path,
+    double Q,
+    double R) {
+    
+    if (!input_file_path || !output_file_path) {
+        return FUSION_ERROR_INVALID_DATA;
+    }
+    
+    try {
+        return fusion::process_fusion_realtime_internal(
+            std::string(input_file_path),
+            std::string(output_file_path),
+            Q,
+            R
+        );
+    } catch (const std::exception& e) {
+        std::cerr << "Exception in fusion_process_csv_realtime: " << e.what() << std::endl;
+        return FUSION_ERROR_UNKNOWN;
+    } catch (...) {
+        std::cerr << "Unknown exception in fusion_process_csv_realtime" << std::endl;
+        return FUSION_ERROR_UNKNOWN;
+    }
+}
+
 FUSION_API const char* fusion_get_error_message(int error_code) {
     switch (error_code) {
         case FUSION_SUCCESS:
@@ -380,4 +630,5 @@ FUSION_API const char* fusion_get_error_message(int error_code) {
 }
 
 } // extern "C"
+
 
