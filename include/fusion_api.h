@@ -62,6 +62,22 @@ FUSION_API int fusion_process_csv_batch(
 );
 
 /**
+ * 실시간 모드로 CSV를 처리하고 상태를 파일로 저장/복원
+ *
+ * @param input_file_path 입력 CSV 파일 경로 (DateTime, GPS_Y, GPS_Z, Acc_Y, Acc_Z, Fix)
+ * @param output_file_path 출력 CSV 파일 경로 (DateTime, Displacement_Y, Displacement_Z)
+ * @param Q 프로세스 노이즈 공분산
+ * @param R 측정 노이즈 공분산
+ * @return 성공 시 FUSION_SUCCESS, 실패 시 오류 코드
+ */
+FUSION_API int fusion_process_csv_realtime(
+    const char* input_file_path,
+    const char* output_file_path,
+    double Q,
+    double R
+);
+
+/**
  * 오류 코드를 문자열로 변환
  * 
  * @param error_code 오류 코드
@@ -74,4 +90,5 @@ FUSION_API const char* fusion_get_error_message(int error_code);
 #endif
 
 #endif // FUSION_API_H
+
 
